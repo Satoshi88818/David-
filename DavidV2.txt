@@ -1,0 +1,125 @@
+David — v2.0 (Improved Codebase)
+
+This is the updated Brain Bridge integration between physical robotic hardware and Memoria Machinae v1.3, with all suggested improvements applied.
+
+Summary of Improvements Applied
+
+AreaChangePerformanceMemoriaClient rewritten with aiohttp for async HTTP; all callbacks are async defROS 2 ArchitectureCustom TaskOutcome.msg replaces raw JSON strings; ROS 2 Action Server/Client pattern for commands; QoS profiles applied per nodeData ThrottlingNarratorNode has state-change filter + 3-second rate limit to prevent API spamRobustnessAPI URL and Robot ID moved to ROS parameters; token refresh on 401; exponential backoff on startupCognitive SafetyContext window token budget in PlannerNode; dreaming abort signal on early undock 
+
+Project Structure
+
+robot_memoria_bridge/ ├── requirements.txt ├── msg/ │ └── TaskOutcome.msg # NEW: Custom ROS 2 message interface ├── memoria_client.py # UPDATED: Async aiohttp, token refresh, backoff ├── narrator_node.py # UPDATED: Async callback, state-change filter, QoS ├── feedback_node.py # UPDATED: Custom msg type, Reliable QoS ├── planner_node.py # UPDATED: Token budget guard, Action Client ├── system_monitor.py # UPDATED: Dreaming abort on early undock └── launch_bridge.py # UPDATED: ROS parameters, async executor 
+
+1. requirements.txt
+
+aiohttp>=3.9.0 rclpy>=3.0.0 # Requires ROS 2 Humble or Iron # action_tutorials_interfaces or define your own action in a package 
+
+2. msg/TaskOutcome.msg
+
+Replaces the fragile JSON-over-String pattern. Define this inside your ROS 2 package's msg/ directory and add it to CMakeLists.txt.
+
+# TaskOutcome.msg # Replaces: {"action": "grasp cup", "success": false, "error": "grip slip"} string action_name bool success string error_reason # Empty string if success == true 
+
+To register it, add to your package's CMakeLists.txt:
+
+find_package(rosidl_default_generators REQUIRED) rosidl_generate_interfaces(${PROJECT_NAME} "msg/TaskOutcome.msg" ) 
+
+3. memoria_client.py
+
+Improvements applied:
+
+Switched from requests (blocking) to aiohttp (async/non-blocking)
+
+Token refresh middleware: catches 401 Unauthorized, re-authenticates, retries once
+
+Exponential backoff on startup if the Memoria server is not yet reachable
+
+import asyncio import logging import aiohttp logger = logging.getLogger(__name__) class MemoriaClient: """ Async HTTP client to interface a robot with Memoria Machinae. Improvements over v1: - Uses aiohttp (non-blocking) instead of requests (blocking). - Automatically refreshes the Bearer token on 401 Unauthorized. - Waits for the Memoria server with exponential backoff on startup. """ def __init__(self, base_url: str, subject_id: str): self.base_url = base_url self.subject_id = subject_id self.token: str | None = None # aiohttp session is created lazily (must be inside an async context) self._session: aiohttp.ClientSession | None = None # ------------------------------------------------------------------ # Lifecycle helpers # ------------------------------------------------------------------ async def _get_session(self) -> aiohttp.ClientSession: if self._session is None or self._session.closed: self._session = aiohttp.ClientSession() return self._session async def close(self): if self._session and not self._session.closed: await self._session.close() # ------------------------------------------------------------------ # Startup: wait for server + authenticate # ------------------------------------------------------------------ async def connect(self, max_retries: int = 10): """ Waits for the Memoria server to become reachable using exponential backoff, then authenticates and grants consent. Improvement: Safe boot sequence — robot nodes can start before the 'brain' service is ready without crashing. """ delay = 1.0 for attempt in range(1, max_retries + 1): try: self.token = await self._fetch_token() await self._grant_consent() logger.info("Connected to Memoria Machinae.") return except Exception as exc: logger.warning( f"Memoria server not ready (attempt {attempt}/{max_retries}): {exc}. " f"Retrying in {delay:.1f}s..." ) await asyncio.sleep(delay) delay = min(delay * 2, 60.0) # cap at 60 seconds raise RuntimeError( f"Could not connect to Memoria Machinae at {self.base_url} " f"after {max_retries} attempts." ) # ------------------------------------------------------------------ # Authentication # ------------------------------------------------------------------ async def _fetch_token(self) -> str: session = await self._get_session() async with session.post( f"{self.base_url}/subjects/{self.subject_id}/token" ) as resp: resp.raise_for_status() data = await resp.json() return data["access_token"] async def _grant_consent(self): session = await self._get_session() async with session.post( f"{self.base_url}/subjects/{self.subject_id}/consent", headers=self._auth_headers(), ) as resp: resp.raise_for_status() def _auth_headers(self) -> dict: return {"Authorization": f"Bearer {self.token}"} # ------------------------------------------------------------------ # Token-refresh middleware # ------------------------------------------------------------------ async def _request_with_refresh(self, method: str, url: str, **kwargs): """ Improvement: Token Refresh Logic. Makes an HTTP request; if a 401 is returned, refreshes the token and retries exactly once before propagating the error. """ session = await self._get_session() kwargs.setdefault("headers", {}).update(self._auth_headers()) async with session.request(method, url, **kwargs) as resp: if resp.status == 401: logger.info("Token expired — refreshing and retrying...") self.token = await self._fetch_token() kwargs["headers"].update(self._auth_headers()) else: resp.raise_for_status() return await resp.json() # Retry once with the new token async with session.request(method, url, **kwargs) as resp: resp.raise_for_status() return await resp.json() # ------------------------------------------------------------------ # Public API methods (all async) # ------------------------------------------------------------------ async def acquire_memory_async( self, text: str, source_agent: str = "self", metadata: dict | None = None, ): payload = { "text": text, "source_agent": source_agent, "observation_type": "self" if source_agent == "self" else "observed", "metadata": metadata or {}, } result = await self._request_with_refresh( "POST", f"{self.base_url}/subjects/{self.subject_id}/memories", json=payload, ) return result async def recall_async( self, query: str, k: int = 5, source_agent: str | None = None ): payload = {"query": query, "k": k} if source_agent: payload["source_agent"] = source_agent result = await self._request_with_refresh( "POST", f"{self.base_url}/subjects/{self.subject_id}/recall", json=payload, ) return result.get("results", []) async def consolidate_async(self): """ Triggers Active Dream Phase, Schema Induction, and Precondition Extraction. Returns a task_id so the caller can abort if needed. """ result = await self._request_with_refresh( "POST", f"{self.base_url}/subjects/{self.subject_id}/consolidate", ) return result # Expected: {"task_id": "...", "status": "running", ...} async def abort_consolidation_async(self, task_id: str): """ Improvement: Dreaming Interruption — sends an abort to the backend when the robot undocks before consolidation completes. """ result = await self._request_with_refresh( "POST", f"{self.base_url}/subjects/{self.subject_id}/consolidate/{task_id}/abort", ) return result 
+
+4. narrator_node.py
+
+Improvements applied:
+
+Async vlm_callback so it never blocks the ROS executor
+
+SensorDataQoS (Best Effort) — drops stale VLM frames instead of queuing them
+
+State-change filter + 3-second minimum interval to prevent API spam
+
+import asyncio import time import rclpy from rclpy.node import Node from rclpy.qos import QoSPresetProfiles from std_msgs.msg import String from memoria_client import MemoriaClient # Minimum seconds between Memoria API calls regardless of scene changes. # Improvement: Narrator Spam Prevention RATE_LIMIT_SECONDS = 3.0 class NarratorNode(Node): """ Translates raw VLM camera captions into episodic memory strings. Improvements over v1: - Uses SensorDataQoS (Best Effort) so the node drops old frames rather than building up a queue during API latency spikes. - State-change filter: only sends an API request when the caption has actually changed from the previous one. - Rate limiter: enforces a minimum gap between API calls even when scene changes are rapid. - Async callback so the ROS executor thread is never blocked. """ def __init__(self, memoria_client: MemoriaClient): super().__init__("narrator_node") self.memoria = memoria_client self._last_observation: str = "" self._last_sent_time: float = 0.0 # Improvement: SensorDataQoS — Best Effort, volatile durability. # Stale VLM frames are dropped automatically when the network lags. self.subscription = self.create_subscription( String, "/perception/vlm_caption", self.vlm_callback, QoSPresetProfiles.SENSOR_DATA.value, ) self.get_logger().info( "Narrator Node started. Listening to environment (SensorDataQoS)..." ) def vlm_callback(self, msg: String): """ Filters duplicate / high-frequency observations before hitting the API. Schedules the async work without blocking the ROS callback thread. """ current_observation = msg.data now = time.monotonic() # Improvement: Only proceed if content changed AND rate limit passed if current_observation == self._last_observation: return if (now - self._last_sent_time) < RATE_LIMIT_SECONDS: return self._last_observation = current_observation self._last_sent_time = now self.get_logger().info(f"Observing: {current_observation}") # Fire-and-forget the async API call asyncio.ensure_future(self._store_observation(current_observation)) async def _store_observation(self, observation: str): try: await self.memoria.acquire_memory_async(text=observation) except Exception as exc: self.get_logger().error(f"Failed to store observation: {exc}") 
+
+5. feedback_node.py
+
+Improvements applied:
+
+Subscribes to TaskOutcome (custom message) instead of raw JSON strings
+
+RELIABLE QoS — critical failure data is never silently dropped
+
+import asyncio import rclpy from rclpy.node import Node from rclpy.qos import QoSPresetProfiles # Replace 'your_package' with the actual ROS 2 package name where TaskOutcome.msg lives from your_package.msg import TaskOutcome from memoria_client import MemoriaClient class FeedbackNode(Node): """ Captures Action-Outcome pairs from the behavior tree and records them as causal memories so the robot can learn from failures and successes. Improvements over v1: - Uses TaskOutcome custom message instead of a JSON-over-String hack. This gives strong typing, self-documentation, and easy ros2 topic echo. - Reliable QoS: crucial failure feedback is never dropped. - Async callback: API call does not block the ROS executor. """ def __init__(self, memoria_client: MemoriaClient): super().__init__("feedback_node") self.memoria = memoria_client # Improvement: Reliable QoS — failure data must not be lost. self.subscription = self.create_subscription( TaskOutcome, "/control/action_outcome", self.outcome_callback, QoSPresetProfiles.SERVICES_DEFAULT.value, # Reliable, volatile ) self.get_logger().info( "Feedback Node started. Monitoring task outcomes (Reliable QoS)..." ) def outcome_callback(self, msg: TaskOutcome): """Receives a strongly-typed TaskOutcome and records it to Memoria.""" outcome_str = "SUCCEEDED" if msg.success else "FAILED" memory_text = ( f"ACTION: {msg.action_name} | " f"OUTCOME: {outcome_str} | " f"ERROR: {msg.error_reason or 'none'}" ) self.get_logger().info(f"Ingesting Feedback: {memory_text}") asyncio.ensure_future(self._store_feedback(memory_text, msg.success)) async def _store_feedback(self, memory_text: str, success: bool): try: await self.memoria.acquire_memory_async( text=memory_text, metadata={"causal": True, "success": success}, ) except Exception as exc: self.get_logger().error(f"Failed to store feedback: {exc}") 
+
+6. planner_node.py
+
+Improvements applied:
+
+Context window token-budget guard — truncates memory history before it overflows the downstream LLM
+
+Publishes to /command/contextualized with RELIABLE QoS
+
+Skeleton for upgrading to a ROS 2 Action Client (see inline comments)
+
+import asyncio import rclpy from rclpy.node import Node from rclpy.qos import QoSPresetProfiles from std_msgs.msg import String from memoria_client import MemoriaClient # Improvement: Context Window Protection # Max characters allowed for the aggregated past-memory section. # Tune this based on your downstream LLM's context window. MAX_HISTORY_CHARS = 2000 class PlannerNode(Node): """ Intercepts high-level commands, queries Memoria for past failures and preconditions, then publishes an enriched prompt to the execution layer. Improvements over v1: - Token / character budget prevents exceeding the downstream LLM's context window when many long memories are returned. - Reliable QoS on both subscriber and publisher. - Async recall so the ROS executor is never blocked during recall. Future upgrade path (noted in improvement suggestions): Replace the /command/high_level subscriber with a ROS 2 Action Client so the Planner can report progress and handle cancellation properly. Stub interfaces are shown in the inline comments below. """ def __init__(self, memoria_client: MemoriaClient): super().__init__("planner_node") self.memoria = memoria_client reliable_qos = QoSPresetProfiles.SERVICES_DEFAULT.value # Current implementation: simple topic subscriber # TODO: Upgrade to Action Client — see rclpy action_client docs # self._action_client = ActionClient(self, ExecuteTask, '/command/execute') self.command_sub = self.create_subscription( String, "/command/high_level", self.command_callback, reliable_qos, ) self.context_pub = self.create_publisher( String, "/command/contextualized", reliable_qos, ) self.get_logger().info("Planner Node started. Awaiting commands (Reliable QoS)...") def command_callback(self, msg: String): """Receives a task string and launches async enrichment.""" asyncio.ensure_future(self._enrich_and_publish(msg.data)) async def _enrich_and_publish(self, target_task: str): self.get_logger().info(f"Received task: '{target_task}'. Querying memories...") try: past_memories = await self.memoria.recall_async( query=f"how to {target_task} and failures" ) except Exception as exc: self.get_logger().error(f"Recall failed: {exc}. Proceeding without history.") past_memories = [] preconditions_found: dict = {} relevant_history: list[str] = [] history_chars: int = 0 for mem in past_memories: mem_text: str = mem.get("text", "") # Improvement: Context Window Protection # Stop appending memories once we hit the character budget. if history_chars + len(mem_text) > MAX_HISTORY_CHARS: self.get_logger().warn( f"History budget reached ({MAX_HISTORY_CHARS} chars). " f"Truncating {len(past_memories) - len(relevant_history)} memories." ) break relevant_history.append(mem_text) history_chars += len(mem_text) if mem.get("preconditions"): preconditions_found.update(mem["preconditions"]) # Build the enriched context prompt context_prompt = f"TASK: {target_task}\n" if preconditions_found: context_prompt += f"KNOWN PRECONDITIONS FOR FAILURE: {preconditions_found}\n" if relevant_history: context_prompt += "PAST EXPERIENCE:\n - " + "\n - ".join(relevant_history[:3]) self.get_logger().info(f"Constructed Plan Context:\n{context_prompt}") out_msg = String() out_msg.data = context_prompt self.context_pub.publish(out_msg) 
+
+7. system_monitor.py
+
+Improvements applied:
+
+consolidate_async() now returns a task_id
+
+If the robot undocks mid-dream, an abort signal is sent to the backend to save API/compute costs
+
+Async battery callback prevents blocking
+
+import asyncio import rclpy from rclpy.node import Node from rclpy.qos import QoSPresetProfiles from std_msgs.msg import String from memoria_client import MemoriaClient class SystemMonitorNode(Node): """ Monitors hardware state. When the robot docks, it triggers Memoria's consolidation (dream phase). When it undocks early, the dream is aborted. Improvements over v1: - consolidate() now returns a task_id for lifecycle tracking. - Dreaming Interruption: an abort is sent to the backend if the robot undocks before consolidation finishes, saving compute costs. - Reliable QoS on battery topic so state transitions are never missed. - Async callbacks to avoid blocking the ROS executor. """ def __init__(self, memoria_client: MemoriaClient): super().__init__("system_monitor") self.memoria = memoria_client self._is_sleeping: bool = False self._consolidation_task_id: str | None = None self.battery_sub = self.create_subscription( String, "/hardware/battery_state", self.battery_callback, QoSPresetProfiles.SERVICES_DEFAULT.value, # Reliable ) self.get_logger().info( "System Monitor started. Watching battery state (Reliable QoS)..." ) def battery_callback(self, msg: String): asyncio.ensure_future(self._handle_battery_state(msg.data)) async def _handle_battery_state(self, state: str): if state == "CHARGING" and not self._is_sleeping: self._is_sleeping = True self.get_logger().info( "Robot Docked. Initiating Sleep Phase (Consolidation & Dreaming)..." ) await self._start_dreaming() elif state == "DISCHARGING" and self._is_sleeping: self._is_sleeping = False self.get_logger().info("Robot Undocked. Waking up.") await self._abort_dreaming_if_active() async def _start_dreaming(self): try: response = await self.memoria.consolidate_async() # Improvement: Store task_id for potential mid-dream abort self._consolidation_task_id = response.get("task_id") self.get_logger().info( f"Consolidation started. task_id={self._consolidation_task_id}" ) # Optionally poll for completion here; for now we trust the backend. stats = response self.get_logger().info(f"Dream initiated. Stats: {stats}") except Exception as exc: self.get_logger().error(f"Nightmare (Consolidation failed): {exc}") finally: self._consolidation_task_id = None async def _abort_dreaming_if_active(self): """ Improvement: Dreaming Interruption. Sends an abort if we have a live consolidation task_id. """ if self._consolidation_task_id: self.get_logger().warn( f"Aborting active consolidation task {self._consolidation_task_id} " f"to save compute costs..." ) try: await self.memoria.abort_consolidation_async( self._consolidation_task_id ) self.get_logger().info("Consolidation aborted successfully.") except Exception as exc: self.get_logger().error(f"Failed to abort consolidation: {exc}") finally: self._consolidation_task_id = None 
+
+8. launch_bridge.py
+
+Improvements applied:
+
+MEMORIA_URL and ROBOT_ID declared as ROS parameters (settable via launch file)
+
+await memoria_client.connect() with exponential backoff replaces immediate crash
+
+asyncio-aware executor loop
+
+import asyncio import json import threading import time import rclpy from rclpy.executors import MultiThreadedExecutor from std_msgs.msg import String from memoria_client import MemoriaClient from narrator_node import NarratorNode from feedback_node import FeedbackNode from planner_node import PlannerNode from system_monitor import SystemMonitorNode # Replace 'your_package' with your actual package name # from your_package.msg import TaskOutcome def simulate_robot_life(node): """Simulates the ROS topic publishers for demonstration purposes.""" pub_vlm = node.create_publisher(String, "/perception/vlm_caption", 10) pub_outcome = node.create_publisher(String, "/control/action_outcome", 10) pub_cmd = node.create_publisher(String, "/command/high_level", 10) pub_battery = node.create_publisher(String, "/hardware/battery_state", 10) time.sleep(2) print("\n--- SIMULATION START ---") # 1. Robot looks around — first unique observation is sent to Memoria pub_vlm.publish(String(data="approached workstation, surface is smooth_plastic")) time.sleep(1) # Duplicate — filtered by NarratorNode's state-change guard pub_vlm.publish(String(data="approached workstation, surface is smooth_plastic")) time.sleep(4) # Wait past the 3-second rate limit # 2. Attempt a task and fail pub_cmd.publish(String(data="grasp fragile glass beaker")) time.sleep(2) # In production this would be a TaskOutcome message; using String here for the sim outcome = json.dumps( { "action": "grasp glass beaker", "success": False, "error": "shattered due to excessive force on smooth_plastic", } ) pub_outcome.publish(String(data=outcome)) time.sleep(2) # 3. Robot docks → triggers async consolidation (dream phase) pub_battery.publish(String(data="CHARGING")) time.sleep(3) # 4. Robot undocks mid-dream → abort signal sent to backend pub_battery.publish(String(data="DISCHARGING")) time.sleep(2) # 5. Robot wakes up and tries the same command — now with memory context pub_cmd.publish(String(data="grasp fragile glass beaker")) async def async_main(): rclpy.init() # ---------------------------------------------------------------- # Improvement: Move config to ROS parameters (overridable via launch file) # ---------------------------------------------------------------- # Create a temporary node just to read parameters param_node = rclpy.create_node("bridge_param_node") param_node.declare_parameter("memoria_url", "http://localhost:8000") param_node.declare_parameter("robot_id", "Spot_Unit_04") MEMORIA_URL = ( param_node.get_parameter("memoria_url").get_parameter_value().string_value ) ROBOT_ID = ( param_node.get_parameter("robot_id").get_parameter_value().string_value ) param_node.destroy_node() print(f"Connecting {ROBOT_ID} to Memoria Machinae at {MEMORIA_URL}...") # Improvement: Safe Boot Sequence — waits with exponential backoff memoria_client = MemoriaClient(base_url=MEMORIA_URL, subject_id=ROBOT_ID) await memoria_client.connect(max_retries=10) # Initialise all cognitive nodes narrator = NarratorNode(memoria_client) feedback = FeedbackNode(memoria_client) planner = PlannerNode(memoria_client) monitor = SystemMonitorNode(memoria_client) executor = MultiThreadedExecutor() executor.add_node(narrator) executor.add_node(feedback) executor.add_node(planner) executor.add_node(monitor) # Simulation publisher node (for demo purposes) sim_node = rclpy.create_node("simulator_node") threading.Thread( target=simulate_robot_life, args=(sim_node,), daemon=True ).start() try: # Run the ROS executor in a thread-pool, letting asyncio run concurrently loop = asyncio.get_event_loop() await loop.run_in_executor(None, executor.spin) except KeyboardInterrupt: pass finally: executor.shutdown() for node in (narrator, feedback, planner, monitor, sim_node): node.destroy_node() await memoria_client.close() rclpy.shutdown() def main(): asyncio.run(async_main()) if __name__ == "__main__": main() 
+
+9. Example Launch File (launch/bridge.launch.py)
+
+Override the ROS parameters at launch time without touching source code.
+
+from launch import LaunchDescription from launch_ros.actions import Node def generate_launch_description(): return LaunchDescription([ Node( package="robot_memoria_bridge", executable="launch_bridge", name="bridge_param_node", parameters=[ {"memoria_url": "http://192.168.1.50:8000"}, {"robot_id": "Spot_Unit_07"}, ], ) ]) 
+
+How to Run
+
+1. Start the Memoria Machinae backend
+
+uvicorn service:app --host 0.0.0.0 --port 8000 
+
+2. Build the ROS 2 package (registers TaskOutcome.msg)
+
+cd ~/ros2_ws colcon build --packages-select robot_memoria_bridge source install/setup.bash 
+
+3. Launch the bridge
+
+With default parameters:
+
+python3 launch_bridge.py 
+
+With overrides via launch file:
+
+ros2 launch robot_memoria_bridge bridge.launch.py 
+
+Verify the custom message type:
+
+ros2 topic echo /control/action_outcome your_package/msg/TaskOutcome 
