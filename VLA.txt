@@ -1,0 +1,130 @@
+Creating a VLA (Vision-Language-Action) model specifically tailored for **David** requires a unique approach because of David's **Brain/Stem separation architecture**. 
+
+Unlike standard VLAs (like RT-X or OpenVLA) that attempt to output low-level joint angles (which is dangerous and computationally heavy), a "David-VLA" should act as a **Semantic VLA**. It must ingest pixels and text, but output structured JSON commands (`MotorPrimitiveMsg`) that map strictly to David’s `SKILL_LIBRARY`. 
+
+Here is the blueprint for creating, training, and integrating a custom VLA for David.
+
+---
+
+### Phase 1: Selecting the Base Edge Model
+Since David is designed for local edge computing (using Ollama and predictive CPU throttling), you cannot use a massive 70B parameter model. You need a highly efficient, quantized multi-modal Small Language Model (SLM).
+
+**Recommended Base Models:**
+*   **Phi-3.5-Vision (or Qwen2.5-VL-3B):** Extremely capable on edge devices, lightweight, and specifically designed for strong reasoning over images. 
+*   **Why?** The current `local_llm.py` defaults to `phi3:mini`. Fine-tuning the Vision variant of Phi-3 maintains architectural consistency and allows 4-bit/8-bit quantization to run on consumer hardware or a Jetson Orin.
+
+### Phase 2: Defining the I/O Contract (The Prompt)
+To train the model, we must define exactly what the VLA "sees" and what it "does." 
+
+**Input (Multimodal Prompt):**
+1.  **Image:** `<image_token>` (First-person camera view).
+2.  **Proprioception State:** Injected from the Stem (e.g., `{"com_fraction": 0.5, "holding_weight_kg": 0.0, "status": "stable"}`).
+3.  **Task:** "Grasp the fragile glass beaker."
+4.  **Context (RAG):** The top 2 procedural memories injected by `CognitiveCore`.
+
+**Output (Structured Action):**
+The model must output a JSON object matching David's Pydantic `MotorPrimitiveMsg` schema, plus an `expected_trajectory` for the WorldModel.
+
+```json
+{
+  "primitive_name": "grasp",
+  "parameters": {"grip_force": "soft", "target_pose":[0.4, 0.1, 0.3]},
+  "confidence": 0.85,
+  "expected_trajectory": ["status: stable, holding_weight: 0.1kg"]
+}
+```
+
+### Phase 3: The Data Flywheel (Bootstrapping Training Data)
+You don't need to manually teleoperate the robot 10,000 times. David v3.3 already generates its own training data via the `DreamEngine` and `GraphMemory`.
+
+1.  **Run David v3.3 in the wild:** Let it use the current text-only LLM + `SkillEmbedder` to perform tasks.
+2.  **Harvest the ChromaDB:** 
+    *   Filter `MemoryType.EPISODIC` for `success == True` and `surprise_score < 0.2`. These are your **Gold Standard** positive trajectories.
+    *   Extract the synchronized camera frame from when that memory was created.
+3.  **Mine the Reflections:**
+    *   Filter for `reflex_triggered == True`. Look at the `ReflectionEngine` lesson (e.g., "Walking on wet surfaces requires cautious gait").
+    *   Create **Direct Preference Optimization (DPO)** pairs: 
+        *   *Rejected output:* `walk` (caused a reflex).
+        *   *Preferred output:* `walk_cautious` (the corrected action derived from reflection).
+
+### Phase 4: Training Methodology
+1.  **Supervised Fine-Tuning (SFT) via LoRA:** 
+    *   Freeze the base Vision and Language models.
+    *   Train a Low-Rank Adaptation (LoRA) adapter specifically on David's `SKILL_LIBRARY`. The loss function penalizes the model heavily if it hallucinates a primitive not in the library.
+2.  **Confidence Calibration (Crucial for the Stem):**
+    *   Train the model to output *lower* `confidence` scores when the image contains novel environments. 
+    *   Why? Because the v3.3 `StemStateNode` has an **Uncertainty Gate** (`CONFIDENCE_GATE = 0.35`). If the VLA is unsure, it *must* output a low confidence so the Stem rejects it and asks for help, rather than hallucinating a dangerous movement.
+
+### Phase 5: Implementing `vla_adapter.py`
+Once the model is trained (e.g., exported as a `.gguf` file to run in Ollama or `llama.cpp`), you implement the v4.0 stub to enforce strict boundary safety.
+
+```python
+"""
+vla_adapter.py — VLA Adapter for David v4.0.
+Converts Vision + Text into strictly validated MotorPrimitives.
+"""
+import json
+import logging
+import base64
+from pydantic import ValidationError
+from llm.base_llm import BaseLLM
+from cognitive_core.schemas import MotorPrimitiveMsg
+from cognitive_core.skill_embedder import SKILL_LIBRARY
+
+logger = logging.getLogger(__name__)
+
+class VLAAdapter(BaseLLM):
+    def __init__(self, model_name: str = "david-vla-phi3-vision:q4"):
+        self._model = model_name
+        import ollama
+        self._client = ollama.AsyncClient()
+
+    @property
+    def model_name(self) -> str:
+        return self._model
+
+    async def generate_action(self, image_path: str, task: str, proprioception: str) -> MotorPrimitiveMsg:
+        """Processes image + state -> returns safe Motor Primitive."""
+        
+        with open(image_path, "rb") as img_file:
+            img_b64 = base64.b64encode(img_file.read()).decode("utf-8")
+
+        prompt = (
+            f"Task: {task}\n"
+            f"Proprioception: {proprioception}\n"
+            f"Available Skills: {list(SKILL_LIBRARY.keys())}\n"
+            "Output JSON action:"
+        )
+
+        try:
+            response = await self._client.generate(
+                model=self._model,
+                prompt=prompt,
+                images=[img_b64],
+                format="json" # Force JSON output
+            )
+            raw_json = response["response"]
+            data = json.loads(raw_json)
+            
+            # 1. Pydantic Validation (The Brain Boundary)
+            primitive = MotorPrimitiveMsg(**data)
+            
+            # 2. Hallucination Check
+            if primitive.primitive_name not in SKILL_LIBRARY:
+                raise ValueError(f"VLA hallucinated skill: {primitive.primitive_name}")
+                
+            return primitive
+
+        except (json.JSONDecodeError, ValidationError) as e:
+            logger.error(f"VLA Output Invalid, defaulting to IDLE: {e}")
+            return MotorPrimitiveMsg(
+                primitive_name="idle", 
+                confidence=0.0, # Forces the Stem's Uncertainty Gate to reject
+                parameters_json="{}"
+            )
+```
+
+### Why this specific VLA approach is powerful for David:
+1.  **The Stem remains the Ultimate Authority:** Even if the VLA goes crazy and outputs `{"primitive_name": "run", "confidence": 0.99}` while the robot is near a cliff, the Stem's 10Hz IMU loop will detect the CoM shift and instantly override the VLA with a `brace_for_impact` reflex.
+2.  **Solves the "Brittle Planner" problem:** In v3.3, the LLM splits text into subtasks. A VLA can look at a messy desk and *visually* sequence the tasks without needing perfect text descriptions.
+3.  **Graceful Downgrade:** If the VLA takes too long to process an image (triggering the `SystemMonitorNode`'s latency threshold), David can call `LocalLLM.downgrade()` to instantly hot-swap back to the text-only `phi3:mini` model + `SkillEmbedder`, acting blind but safe until compute frees up.
