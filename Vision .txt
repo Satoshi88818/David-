@@ -1,0 +1,170 @@
+### Pipeline Architecture
+
+```
+BEV Input Generator 
+        ↓
+Vision Module (MapFormer) + Temporal Memory (Mamba SSM)
+        ↓
+Output Post-Processor
+        ↓
+Visualizer + Downstream Consumer (Simple Planner / Actor Tracker)
+```
+
+---
+
+### Complete Mini-Pipeline Code
+
+```python
+import torch
+from config import ModelConfig
+from heads import MapFormer
+from dataclasses import dataclass
+from typing import List, Optional
+import matplotlib.pyplot as plt
+import numpy as np
+from pathlib import Path
+
+@dataclass
+class PipelineOutput:
+    map_tokens: torch.Tensor
+    drivable_epistemic: torch.Tensor
+    lane_centrelines: torch.Tensor
+    actor_positions: torch.Tensor
+    ssm_hidden: torch.Tensor
+    frame_idx: int
+
+
+class FSDv12MiniPipeline:
+    def __init__(self, device: str = "cuda"):
+        self.config = ModelConfig()
+        self.device = torch.device(device if torch.cuda.is_available() else "cpu")
+        
+        print(f"Loading MapFormer on {self.device}...")
+        self.vision_module = MapFormer(self.config).to(self.device)
+        self.vision_module.eval()
+        
+        self.hidden_state = None  # Temporal memory
+        print("Pipeline initialized.")
+
+    @torch.no_grad()
+    def process_frame(self, bev: torch.Tensor, frame_idx: int) -> PipelineOutput:
+        """Process one BEV frame with temporal memory"""
+        if len(bev.shape) == 3:
+            bev = bev.unsqueeze(0)  # Add batch dimension
+        
+        bev = bev.to(self.device)
+        
+        vision_output = self.vision_module(
+            bev=bev, 
+            hidden_state=self.hidden_state
+        )
+        
+        # Update hidden state for next frame
+        self.hidden_state = vision_output.ssm_hidden
+        
+        return PipelineOutput(
+            map_tokens=vision_output.map_tokens,
+            drivable_epistemic=vision_output.drivable_epistemic,
+            lane_centrelines=vision_output.lane_centrelines,
+            actor_positions=vision_output.actor_positions,
+            ssm_hidden=vision_output.ssm_hidden,
+            frame_idx=frame_idx
+        )
+
+    def reset_memory(self):
+        """Reset temporal memory (e.g. new scenario)"""
+        self.hidden_state = None
+
+
+# ============================
+# 1. BEV Input Generator (Dummy / Simulated)
+# ============================
+
+def generate_dummy_bev_sequence(num_frames: int = 30, batch_size: int = 1):
+    """Simulate a sequence of BEV frames (you can replace with real rasterizer later)"""
+    config = ModelConfig()
+    sequence = []
+    
+    for i in range(num_frames):
+        # Add some temporal variation
+        noise = torch.randn(batch_size, config.bev_channels, config.bev_h, config.bev_w)
+        # Simulate moving objects by shifting channels or adding patterns
+        frame = noise + 0.1 * torch.sin(torch.tensor(i / 5.0))
+        sequence.append(frame)
+    
+    return sequence
+
+
+# ============================
+# 2. Main Pipeline Runner
+# ============================
+
+def run_mini_pipeline(num_frames: int = 30, visualize: bool = True):
+    pipeline = FSDv12MiniPipeline(device="cuda")
+    bev_sequence = generate_dummy_bev_sequence(num_frames)
+    
+    outputs: List[PipelineOutput] = []
+    
+    print(f"\nRunning pipeline for {num_frames} frames...\n")
+    
+    for i, bev_frame in enumerate(bev_sequence):
+        out = pipeline.process_frame(bev_frame, i)
+        outputs.append(out)
+        
+        if (i + 1) % 10 == 0 or i == 0:
+            print(f"Frame {i+1:2d} | "
+                  f"Map Tokens: {out.map_tokens.shape} | "
+                  f"Actors: {out.actor_positions.shape[0] if out.actor_positions.numel() > 0 else 0} | "
+                  f"Uncertainty: {out.drivable_epistemic.mean():.4f}")
+    
+    print("\nPipeline completed successfully!")
+    
+    if visualize:
+        visualize_results(outputs, bev_sequence)
+    
+    return outputs
+
+
+# ============================
+# 3. Visualization
+# ============================
+
+def visualize_results(outputs: List[PipelineOutput], bev_sequence: List[torch.Tensor]):
+    """Basic visualization - extend this heavily"""
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    
+    # Last frame visualization
+    last = outputs[-1]
+    bev = bev_sequence[-1][0]  # first channel for visualization
+    
+    axes[0,0].imshow(bev[0].cpu().numpy(), cmap='gray')  # e.g. intensity
+    axes[0,0].set_title("BEV Input (Channel 0)")
+    
+    # Epistemic Uncertainty
+    unc = last.drivable_epistemic[0].cpu().numpy()
+    im = axes[0,1].imshow(unc, cmap='hot')
+    axes[0,1].set_title("Epistemic Uncertainty\n(red = avoid)")
+    plt.colorbar(im, ax=axes[0,1])
+    
+    axes[0,2].set_title("Detected Actors + Lanes")
+    # Placeholder for actor & lane overlay (implement properly)
+    axes[0,2].text(0.5, 0.5, f"{len(last.actor_positions)} Actors\n"
+                             f"Lanes: {last.lane_centrelines.shape}", 
+                   ha='center', va='center', transform=axes[0,2].transAxes)
+    
+    plt.tight_layout()
+    plt.show()
+
+
+# ============================
+# Run it
+# ============================
+
+if __name__ == "__main__":
+    outputs = run_mini_pipeline(num_frames=50, visualize=True)
+```
+
+
+
+
+
