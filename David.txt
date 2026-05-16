@@ -1,0 +1,358 @@
+
+
+
+Here is a complete, runnable ROS 2 (Python) integration codebase. 
+
+This codebase acts as the **"Brain Bridge"** between physical robotic hardware and the `Memoria Machinae v1.3` microservice. It implements the **Narrator**, **Feedback**, **Planner**, and **System Monitor** nodes described earlier.
+
+### Project Structure
+```text
+robot_memoria_bridge/
+├── requirements.txt
+├── memoria_client.py       # API wrapper for Memoria Machinae
+├── narrator_node.py        # Translates sensor streams into episodic memories
+├── feedback_node.py        # Ingests structured action-outcome causal data
+├── planner_node.py         # Recalls preconditions and adjusts actions
+├── system_monitor.py       # Triggers consolidation/dreaming while charging
+└── launch_bridge.py        # Main entry point to spin up the robot mind
+```
+
+### 1. `requirements.txt`
+```text
+requests>=2.31.0
+rclpy>=3.0.0      # Assumes you are in a ROS 2 environment (Humble/Iron)
+# If running without ROS 2, you can adapt the node structure to standard async python.
+```
+
+### 2. `memoria_client.py`
+This handles the networking between the robot and the Memoria server.
+```python
+import requests
+import logging
+
+class MemoriaClient:
+    """Synchronous HTTP client to interface robot with Memoria Machinae."""
+    def __init__(self, base_url: str, subject_id: str):
+        self.base_url = base_url
+        self.subject_id = subject_id
+        self.token = self._get_token()
+        self.headers = {"Authorization": f"Bearer {self.token}"}
+        self._grant_consent()
+
+    def _get_token(self) -> str:
+        res = requests.post(f"{self.base_url}/subjects/{self.subject_id}/token")
+        res.raise_for_status()
+        return res.json()["access_token"]
+
+    def _grant_consent(self):
+        requests.post(f"{self.base_url}/subjects/{self.subject_id}/consent", headers=self.headers)
+
+    def acquire_memory(self, text: str, source_agent: str = "self", metadata: dict = None):
+        payload = {
+            "text": text,
+            "source_agent": source_agent,
+            "observation_type": "self" if source_agent == "self" else "observed",
+            "metadata": metadata or {}
+        }
+        res = requests.post(f"{self.base_url}/subjects/{self.subject_id}/memories", headers=self.headers, json=payload)
+        if res.status_code != 200:
+            logging.error(f"Failed to acquire memory: {res.text}")
+        return res.json()
+
+    def recall(self, query: str, k: int = 5, source_agent: str = None):
+        payload = {"query": query, "k": k}
+        if source_agent:
+            payload["source_agent"] = source_agent
+        res = requests.post(f"{self.base_url}/subjects/{self.subject_id}/recall", headers=self.headers, json=payload)
+        res.raise_for_status()
+        return res.json().get("results",[])
+
+    def consolidate(self):
+        """Triggers Active Dream Phase, Schema Induction, and Precondition Extraction."""
+        res = requests.post(f"{self.base_url}/subjects/{self.subject_id}/consolidate", headers=self.headers)
+        res.raise_for_status()
+        return res.json()
+```
+
+### 3. `narrator_node.py`
+This node acts as the robot's stream of consciousness, capturing significant environmental changes.
+```python
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import String
+from memoria_client import MemoriaClient
+
+class NarratorNode(Node):
+    """
+    Translates raw robotic telemetry and VLM camera captions into episodic memory strings.
+    """
+    def __init__(self, memoria_client: MemoriaClient):
+        super().__init__('narrator_node')
+        self.memoria = memoria_client
+        
+        # Subscribe to a simulated Vision-Language Model output topic
+        self.subscription = self.create_subscription(
+            String,
+            '/perception/vlm_caption',
+            self.vlm_callback,
+            10
+        )
+        self.get_logger().info("Narrator Node started. Listening to environment...")
+
+    def vlm_callback(self, msg):
+        """Called when the onboard camera detects a significant scene change."""
+        observation = msg.data
+        self.get_logger().info(f"Observing: {observation}")
+        
+        # Send to Memoria (Predictive coding happens automatically on the backend)
+        self.memoria.acquire_memory(text=observation)
+```
+
+### 4. `feedback_node.py`
+This node monitors action outcomes and ingests causal data (Action -> Outcome).
+```python
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import String
+import json
+from memoria_client import MemoriaClient
+
+class FeedbackNode(Node):
+    """
+    Captures Action-Outcome pairs from the behavior tree and records them 
+    as causal memories so the robot can learn from failures and successes.
+    """
+    def __init__(self, memoria_client: MemoriaClient):
+        super().__init__('feedback_node')
+        self.memoria = memoria_client
+        
+        self.subscription = self.create_subscription(
+            String,
+            '/control/action_outcome',
+            self.outcome_callback,
+            10
+        )
+        self.get_logger().info("Feedback Node started. Monitoring task outcomes...")
+
+    def outcome_callback(self, msg):
+        # Expecting JSON string: {"action": "grasp cup", "success": false, "error": "grip slip"}
+        try:
+            data = json.loads(msg.data)
+            action = data.get("action")
+            success = data.get("success")
+            error = data.get("error", "none")
+            
+            outcome_str = "SUCCEEDED" if success else "FAILED"
+            memory_text = f"ACTION: {action} | OUTCOME: {outcome_str} | ERROR: {error}"
+            
+            self.get_logger().info(f"Ingesting Feedback: {memory_text}")
+            
+            # Metadata tag 'causal': True tells Memoria to extract preconditions during sleep
+            self.memoria.acquire_memory(
+                text=memory_text,
+                metadata={"causal": True, "success": success}
+            )
+        except Exception as e:
+            self.get_logger().error(f"Failed to process feedback: {e}")
+```
+
+### 5. `planner_node.py`
+This is the "Prefrontal Cortex". Before moving, it queries the memory bank.
+```python
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import String
+from memoria_client import MemoriaClient
+
+class PlannerNode(Node):
+    """
+    Intercepts high-level commands, queries Memoria for past failures/preconditions,
+    and adjusts the prompt/plan for the robot controller.
+    """
+    def __init__(self, memoria_client: MemoriaClient):
+        super().__init__('planner_node')
+        self.memoria = memoria_client
+        
+        self.command_sub = self.create_subscription(
+            String,
+            '/command/high_level',
+            self.command_callback,
+            10
+        )
+        # Publisher to send the refined context to the LLM/Execution layer
+        self.context_pub = self.create_publisher(String, '/command/contextualized', 10)
+        self.get_logger().info("Planner Node started. Awaiting commands...")
+
+    def command_callback(self, msg):
+        target_task = msg.data
+        self.get_logger().info(f"Received task: {target_task}. Querying memories...")
+
+        # 1. Recall past attempts at this task
+        past_memories = self.memoria.recall(query=f"how to {target_task} and failures")
+        
+        # 2. Extract learned preconditions from v1.3 PreconditionLearner
+        preconditions_found = {}
+        relevant_history =[]
+        
+        for mem in past_memories:
+            relevant_history.append(mem['text'])
+            if mem.get('preconditions'):
+                preconditions_found.update(mem['preconditions'])
+
+        # 3. Construct prompt for the LLM behavior generator
+        context_prompt = f"TASK: {target_task}\n"
+        if preconditions_found:
+            context_prompt += f"KNOWN PRECONDITIONS FOR FAILURE: {preconditions_found}\n"
+        if relevant_history:
+            context_prompt += f"PAST EXPERIENCE:\n - " + "\n - ".join(relevant_history[:3])
+            
+        self.get_logger().info(f"Constructed Plan Context:\n{context_prompt}")
+        
+        # Publish contextualized prompt to the robot's behavior execution tree
+        out_msg = String()
+        out_msg.data = context_prompt
+        self.context_pub.publish(out_msg)
+```
+
+### 6. `system_monitor.py`
+This triggers the biological sleep cycle when the hardware allows it.
+```python
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import String
+from memoria_client import MemoriaClient
+
+class SystemMonitorNode(Node):
+    """
+    Monitors hardware state. When the robot docks and charges, 
+    it triggers Memoria's Consolidation and Active Dream Phase.
+    """
+    def __init__(self, memoria_client: MemoriaClient):
+        super().__init__('system_monitor')
+        self.memoria = memoria_client
+        self.is_sleeping = False
+        
+        self.battery_sub = self.create_subscription(
+            String,
+            '/hardware/battery_state',
+            self.battery_callback,
+            10
+        )
+        self.get_logger().info("System Monitor started. Watching battery state...")
+
+    def battery_callback(self, msg):
+        state = msg.data # Expected: "DISCHARGING" or "CHARGING"
+        
+        if state == "CHARGING" and not self.is_sleeping:
+            self.is_sleeping = True
+            self.get_logger().info("Robot Docked. Initiating Sleep Phase (Consolidation & Dreaming)...")
+            try:
+                stats = self.memoria.consolidate()
+                self.get_logger().info(f"Woke up! Dream stats: {stats}")
+            except Exception as e:
+                self.get_logger().error(f"Nightmare (Consolidation failed): {e}")
+                
+        elif state == "DISCHARGING" and self.is_sleeping:
+            self.is_sleeping = False
+            self.get_logger().info("Robot Undocked. Waking up.")
+```
+
+### 7. `launch_bridge.py`
+The master script to spin up the entire cognitive bridge and simulate data to test it.
+```python
+import rclpy
+from rclpy.executors import MultiThreadedExecutor
+from memoria_client import MemoriaClient
+import threading
+import time
+import json
+from std_msgs.msg import String
+
+from narrator_node import NarratorNode
+from feedback_node import FeedbackNode
+from planner_node import PlannerNode
+from system_monitor import SystemMonitorNode
+
+def simulate_robot_life(node):
+    """Simulates publishers interacting with the ROS topics for demonstration."""
+    pub_vlm = node.create_publisher(String, '/perception/vlm_caption', 10)
+    pub_outcome = node.create_publisher(String, '/control/action_outcome', 10)
+    pub_cmd = node.create_publisher(String, '/command/high_level', 10)
+    pub_battery = node.create_publisher(String, '/hardware/battery_state', 10)
+    
+    time.sleep(2)
+    print("\n--- SIMULATION START ---")
+    
+    # 1. Robot looks around
+    pub_vlm.publish(String(data="approached workstation, surface is smooth_plastic"))
+    time.sleep(1)
+    
+    # 2. Robot attempts a task and fails
+    pub_cmd.publish(String(data="grasp fragile glass beaker"))
+    time.sleep(2)
+    outcome = json.dumps({"action": "grasp glass beaker", "success": False, "error": "shattered due to excessive force on smooth_plastic"})
+    pub_outcome.publish(String(data=outcome))
+    time.sleep(2)
+    
+    # 3. Robot docks and sleeps (Triggers Dreams & Precondition learning)
+    pub_battery.publish(String(data="CHARGING"))
+    time.sleep(5) # Give it time to consolidate on the backend
+    
+    # 4. Robot wakes up and gets the same command
+    pub_battery.publish(String(data="DISCHARGING"))
+    pub_cmd.publish(String(data="grasp fragile glass beaker"))
+
+def main():
+    rclpy.init()
+
+    # Point to the FastAPI Memoria Machinae v1.3 Microservice
+    MEMORIA_URL = "http://localhost:8000"
+    ROBOT_ID = "Spot_Unit_04"
+    
+    print(f"Connecting {ROBOT_ID} to Memoria Machinae at {MEMORIA_URL}...")
+    memoria_client = MemoriaClient(base_url=MEMORIA_URL, subject_id=ROBOT_ID)
+
+    # Initialize all cognitive nodes
+    narrator = NarratorNode(memoria_client)
+    feedback = FeedbackNode(memoria_client)
+    planner = PlannerNode(memoria_client)
+    monitor = SystemMonitorNode(memoria_client)
+
+    # Use a multithreaded executor to run nodes concurrently
+    executor = MultiThreadedExecutor()
+    executor.add_node(narrator)
+    executor.add_node(feedback)
+    executor.add_node(planner)
+    executor.add_node(monitor)
+
+    # Create a dummy node just to publish simulated topics
+    sim_node = rclpy.create_node('simulator_node')
+    threading.Thread(target=simulate_robot_life, args=(sim_node,), daemon=True).start()
+
+    try:
+        executor.spin()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        executor.shutdown()
+        narrator.destroy_node()
+        feedback.destroy_node()
+        planner.destroy_node()
+        monitor.destroy_node()
+        sim_node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
+```
+
+### How to Run This Full Stack
+1. **Start the Brain Backend:** In a terminal, run the Memoria Machinae v1.3 FastAPI server (the code provided in your original prompt):
+   ```bash
+   uvicorn service:app --host 0.0.0.0 --port 8000
+   ```
+2. **Start the Robot Bridge:** In a new terminal (with ROS 2 sourced), run the integration bridge:
+   ```bash
+   python3 launch_bridge.py
+   ```
+
